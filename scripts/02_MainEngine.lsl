@@ -5,21 +5,18 @@
 //
 // File: 02_MainEngine.lsl
 // Version: 1.01
-// Build: 3B.3 Seamless Playback Preview
+// Build: 5.2T1 — 19.8 Second Timing Test
 //
-// PURPOSE
+// FEATURES
 //
-// • Play UUID sound clips consecutively
-// • Preload upcoming sound UUIDs
-// • Queue the next clip before the current clip ends
-// • Preserve Play, Pause, Continue, and Stop
-// • Ignore non-song Library replies
-//
-// IMPORTANT
-//
-// QUEUE_LEAD_TIME assumes clips are approximately 10 seconds.
-// If your edited clips are consistently shorter or longer,
-// adjust QUEUE_LEAD_TIME after in-world testing.
+// • Seamless queued UUID playback
+// • Preloads upcoming clips
+// • Play / Pause / Continue / Stop
+// • PLAY_SONG support from the song browser
+// • Immediate session volume control
+// • Next / Previous track navigation with wraparound
+// • Preserves each song's notecard volume as its base
+// • Ignores non-song Library replies
 //
 ///////////////////////////////////////////////////////////////
 
@@ -37,10 +34,14 @@ integer API_DB_READY   = 2002;
 // PLAYBACK API
 //==============================================================
 
-integer API_ENGINE_PLAY   = 2100;
-integer API_ENGINE_STOP   = 2101;
-integer API_ENGINE_PAUSE  = 2102;
-integer API_ENGINE_RESUME = 2103;
+integer API_ENGINE_PLAY      = 2100;
+integer API_ENGINE_STOP      = 2101;
+integer API_ENGINE_PAUSE     = 2102;
+integer API_ENGINE_RESUME    = 2103;
+integer API_ENGINE_PLAY_SONG = 2104;
+integer API_ENGINE_VOLUME    = 2105;
+integer API_ENGINE_NEXT      = 2106;
+integer API_ENGINE_PREV      = 2107;
 
 
 //==============================================================
@@ -64,38 +65,46 @@ integer STATE_PAUSED  = 2;
 // PLAYBACK TIMING
 //==============================================================
 
-// Nominal duration of each uploaded clip.
-float CLIP_LENGTH = 10.0;
+float CLIP_LENGTH     = 20.0;
 
-// Queue the next clip this many seconds after the current
-// clip begins. This gives the viewer time to receive the
-// upcoming sound before the transition.
-float QUEUE_LEAD_TIME = 8.75;
+// Proven timing rule: queue 0.2 seconds before the nominal end.
+float QUEUE_LEAD_TIME = 19.80;
 
-// After the final clip is queued, wait this long before
-// reporting that the song has finished.
-float FINAL_WAIT_TIME = 11.25;
+// Time remaining in the current clip when the next clip is queued.
+float QUEUE_TAIL_TIME = 0.20;
+
+// The final clip may override this through LastClipLength.
+float gLastClipLength = 20.0;
 
 
 //==============================================================
 // ENGINE STATUS
 //==============================================================
 
-integer DEBUG = TRUE;
+integer DEBUG = FALSE;
 
-integer gState = STATE_STOPPED;
+integer gState         = STATE_STOPPED;
 integer gDatabaseReady = FALSE;
-integer gSongLoaded = FALSE;
+integer gSongLoaded    = FALSE;
+integer gAutoPlay      = FALSE;
+
+integer gRequestedSongID = 1;
+integer gCurrentSongID   = 1;
+integer gSongCount       = 0;
 
 
 //==============================================================
 // SONG DATA
 //==============================================================
 
-string gTitle = "";
+string gTitle  = "";
 string gArtist = "";
 
-float gVolume = 1.0;
+// Base volume supplied by the song notecard.
+float gSongVolume = 1.0;
+
+// Owner-selected session volume from 0.0 through 1.0.
+float gUserVolume = 1.0;
 
 list gClips = [];
 
@@ -104,19 +113,10 @@ list gClips = [];
 // PLAYBACK POSITION
 //==============================================================
 
-// Clip that began the current playback run.
-integer gRunStartClip = 0;
+integer gRunStartClip      = 0;
+integer gNextClipToQueue   = 0;
+integer gWaitingForFinish  = FALSE;
 
-// Next clip that has not yet been queued.
-integer gNextClipToQueue = 0;
-
-// TRUE after the first queue timer has fired.
-integer gQueueStarted = FALSE;
-
-// TRUE when every clip has already been submitted.
-integer gWaitingForFinish = FALSE;
-
-// Used to estimate which clip was playing when Pause is pressed.
 float gRunStartTime = 0.0;
 
 
@@ -176,17 +176,67 @@ integer IsValidSoundUUID(string value)
 
 
 //==============================================================
-// SOUND QUEUE CONTROL
+// VOLUME
+//==============================================================
+
+float EffectiveVolume()
+{
+    float volume = gSongVolume * gUserVolume;
+
+    if(volume < 0.0)
+        volume = 0.0;
+
+    if(volume > 1.0)
+        volume = 1.0;
+
+    return volume;
+}
+
+SetUserVolume(float volume)
+{
+    if(volume < 0.0)
+        volume = 0.0;
+
+    if(volume > 1.0)
+        volume = 1.0;
+
+    gUserVolume = volume;
+
+    // Changes the currently playing attached sound immediately.
+    llAdjustSoundVolume(EffectiveVolume());
+}
+
+
+//==============================================================
+// QUEUE CONTROL
 //==============================================================
 
 FlushSoundQueue()
 {
-    // Disabling queueing before stopping prevents an already
-    // queued clip from starting after Pause or Stop.
     llSetSoundQueueing(FALSE);
     llStopSound();
     llSetTimerEvent(0.0);
     llSetSoundQueueing(TRUE);
+}
+
+
+//==============================================================
+// LIBRARY REQUESTS
+//==============================================================
+
+RequestSong(integer songID, integer autoPlay)
+{
+    if(songID < 1)
+        songID = 1;
+
+    gRequestedSongID = songID;
+    gAutoPlay = autoPlay;
+
+    llMessageLinked(
+        LINK_SET,
+        API_DB_REQUEST,
+        "GET_SONG|" + (string)songID,
+        NULL_KEY);
 }
 
 
@@ -196,8 +246,6 @@ FlushSoundQueue()
 
 LoadSongPacket(string packet)
 {
-    // API_DB_REPLY also carries SONG_LIST, SONG_COUNT and
-    // LIBRARY_INFO. Only SONG packets belong in this engine.
     if(llSubStringIndex(packet, "SONG|") != 0)
         return;
 
@@ -210,8 +258,14 @@ LoadSongPacket(string packet)
     if(llGetListLength(fields) < 6)
     {
         Debug("Invalid SONG packet.");
+        gAutoPlay = FALSE;
         return;
     }
+
+    integer packetSongID =
+        (integer)llList2String(fields, 1);
+
+    gCurrentSongID = packetSongID;
 
     gTitle =
         llStringTrim(
@@ -223,15 +277,37 @@ LoadSongPacket(string packet)
             llList2String(fields, 3),
             STRING_TRIM);
 
-    gVolume =
+    gSongVolume =
         (float)llStringTrim(
             llList2String(fields, 4),
             STRING_TRIM);
 
+    if(gSongVolume < 0.0)
+        gSongVolume = 0.0;
+
+    if(gSongVolume > 1.0)
+        gSongVolume = 1.0;
+
+    gLastClipLength = 20.0;
+
+    integer clipStart = 5;
+    string metadata = llList2String(fields, 5);
+
+    if(llSubStringIndex(metadata, "LAST=") == 0)
+    {
+        float lastValue =
+            (float)llGetSubString(metadata, 5, -1);
+
+        if(lastValue > 0.0 && lastValue <= 30.0)
+            gLastClipLength = lastValue;
+
+        clipStart = 6;
+    }
+
     list cleanClips = [];
     integer i;
 
-    for(i = 5; i < llGetListLength(fields); ++i)
+    for(i = clipStart; i < llGetListLength(fields); ++i)
     {
         string clip =
             llStringTrim(
@@ -239,23 +315,20 @@ LoadSongPacket(string packet)
                 STRING_TRIM);
 
         if(IsValidSoundUUID(clip))
-        {
             cleanClips += [clip];
-        }
         else
-        {
             Debug(
                 "Skipped invalid clip entry in "
                 + gTitle
                 + ": "
                 + clip);
-        }
     }
 
     if(llGetListLength(cleanClips) == 0)
     {
         gClips = [];
         gSongLoaded = FALSE;
+        gAutoPlay = FALSE;
 
         Debug(
             "No valid sound UUIDs found for "
@@ -272,17 +345,25 @@ LoadSongPacket(string packet)
 
     gRunStartClip = 0;
     gNextClipToQueue = 0;
-    gQueueStarted = FALSE;
     gWaitingForFinish = FALSE;
 
     NotifyNowPlaying();
 
     Debug(
-        "Loaded "
-        + gTitle
-        + " with "
-        + (string)llGetListLength(gClips)
-        + " clip(s).");
+        "Loaded Song "
+        + (string)packetSongID
+        + ": "
+        + gTitle);
+
+    if(gAutoPlay)
+    {
+        gAutoPlay = FALSE;
+
+        gState = STATE_PLAYING;
+        NotifyState();
+
+        BeginPlaybackAt(0);
+    }
 }
 
 
@@ -309,12 +390,15 @@ PreloadClip(integer clipIndex)
 
 
 //==============================================================
-// BEGIN OR RESUME PLAYBACK
+// BEGIN PLAYBACK
 //==============================================================
 
 BeginPlaybackAt(integer clipIndex)
 {
     integer count = llGetListLength(gClips);
+
+    if(count == 0)
+        return;
 
     if(clipIndex < 0)
         clipIndex = 0;
@@ -326,18 +410,14 @@ BeginPlaybackAt(integer clipIndex)
 
     gRunStartClip = clipIndex;
     gNextClipToQueue = clipIndex + 1;
-    gQueueStarted = FALSE;
     gWaitingForFinish = FALSE;
 
     llResetTime();
     gRunStartTime = llGetTime();
 
-    string firstUUID =
-        llList2String(
-            gClips,
-            clipIndex);
-
-    llPlaySound(firstUUID, gVolume);
+    llPlaySound(
+        llList2String(gClips, clipIndex),
+        EffectiveVolume());
 
     if(gNextClipToQueue < count)
     {
@@ -347,13 +427,13 @@ BeginPlaybackAt(integer clipIndex)
     else
     {
         gWaitingForFinish = TRUE;
-        llSetTimerEvent(CLIP_LENGTH);
+        llSetTimerEvent(gLastClipLength);
     }
 }
 
 
 //==============================================================
-// TRANSPORT CONTROLS
+// TRANSPORT
 //==============================================================
 
 StartSong()
@@ -376,13 +456,29 @@ StartSong()
     BeginPlaybackAt(0);
 }
 
+PlaySpecificSong(integer songID)
+{
+    if(!gDatabaseReady)
+    {
+        Debug("Library is not ready.");
+        return;
+    }
+
+    FlushSoundQueue();
+
+    gSongLoaded = FALSE;
+    gState = STATE_STOPPED;
+    NotifyState();
+
+    RequestSong(songID, TRUE);
+}
+
 StopSong()
 {
     FlushSoundQueue();
 
     gRunStartClip = 0;
     gNextClipToQueue = 0;
-    gQueueStarted = FALSE;
     gWaitingForFinish = FALSE;
 
     gState = STATE_STOPPED;
@@ -396,11 +492,9 @@ integer EstimatePlayingClip()
     if(elapsed < 0.0)
         elapsed = 0.0;
 
-    integer offset =
-        (integer)(elapsed / CLIP_LENGTH);
-
     integer clipIndex =
-        gRunStartClip + offset;
+        gRunStartClip
+        + (integer)(elapsed / CLIP_LENGTH);
 
     integer lastClip =
         llGetListLength(gClips) - 1;
@@ -425,7 +519,6 @@ PauseSong()
 
     gRunStartClip = pausedClip;
     gNextClipToQueue = pausedClip + 1;
-    gQueueStarted = FALSE;
     gWaitingForFinish = FALSE;
 
     gState = STATE_PAUSED;
@@ -445,9 +538,67 @@ ResumeSong()
     gState = STATE_PLAYING;
     NotifyState();
 
-    // As before, Continue restarts the clip that was active
-    // when Pause was pressed.
     BeginPlaybackAt(gRunStartClip);
+}
+
+
+//==============================================================
+// TRACK NAVIGATION
+//==============================================================
+
+RequestSongCount()
+{
+    llMessageLinked(
+        LINK_SET,
+        API_DB_REQUEST,
+        "SONG_COUNT",
+        NULL_KEY);
+}
+
+PlayNextSong()
+{
+    if(!gDatabaseReady)
+    {
+        Debug("Library is not ready.");
+        return;
+    }
+
+    if(gSongCount < 1)
+    {
+        Debug("Song count is not available.");
+        RequestSongCount();
+        return;
+    }
+
+    integer nextSong = gCurrentSongID + 1;
+
+    if(nextSong > gSongCount)
+        nextSong = 1;
+
+    PlaySpecificSong(nextSong);
+}
+
+PlayPreviousSong()
+{
+    if(!gDatabaseReady)
+    {
+        Debug("Library is not ready.");
+        return;
+    }
+
+    if(gSongCount < 1)
+    {
+        Debug("Song count is not available.");
+        RequestSongCount();
+        return;
+    }
+
+    integer previousSong = gCurrentSongID - 1;
+
+    if(previousSong < 1)
+        previousSong = gSongCount;
+
+    PlaySpecificSong(previousSong);
 }
 
 
@@ -462,19 +613,22 @@ HandleQueueTimer()
     if(gWaitingForFinish)
     {
         llSetTimerEvent(0.0);
-
         gWaitingForFinish = FALSE;
-        gState = STATE_STOPPED;
-        NotifyState();
+
+        // Clear any residual queued sound before changing songs.
+        FlushSoundQueue();
 
         Debug("Song finished.");
+
+        // Natural completion advances through the library.
+        PlayNextSong();
         return;
     }
 
     if(gNextClipToQueue >= count)
     {
         gWaitingForFinish = TRUE;
-        llSetTimerEvent(FINAL_WAIT_TIME);
+        llSetTimerEvent(gLastClipLength + QUEUE_TAIL_TIME);
         return;
     }
 
@@ -484,34 +638,24 @@ HandleQueueTimer()
             gNextClipToQueue);
 
     if(IsValidSoundUUID(clipUUID))
-    {
-        // Because sound queueing is enabled, this attached
-        // sound waits for the current attached sound to finish.
-        llPlaySound(clipUUID, gVolume);
-    }
+        llPlaySound(clipUUID, EffectiveVolume());
     else
-    {
         Debug(
             "Skipped invalid queued clip "
             + (string)(gNextClipToQueue + 1)
             + ".");
-    }
 
     ++gNextClipToQueue;
-    gQueueStarted = TRUE;
 
     if(gNextClipToQueue < count)
     {
-        // Subsequent queue calls occur one nominal clip length
-        // apart. Each call happens approximately QUEUE_LEAD_TIME
-        // into the clip currently being heard.
         llSetTimerEvent(CLIP_LENGTH);
         PreloadClip(gNextClipToQueue);
     }
     else
     {
         gWaitingForFinish = TRUE;
-        llSetTimerEvent(FINAL_WAIT_TIME);
+        llSetTimerEvent(gLastClipLength + QUEUE_TAIL_TIME);
     }
 }
 
@@ -527,8 +671,7 @@ default
         llSetSoundQueueing(TRUE);
 
         Debug(
-            "Version 1.01 Build 3B.3 "
-            + "Seamless Playback Preview");
+            "Build 5.2T1 — 19.8 Second Timing Test");
 
         NotifyState();
     }
@@ -551,17 +694,24 @@ default
 
             Debug("Library ready.");
 
-            llMessageLinked(
-                LINK_SET,
-                API_DB_REQUEST,
-                "GET_SONG|1",
-                NULL_KEY);
-
+            RequestSongCount();
+            RequestSong(1, FALSE);
             return;
         }
 
         if(num == API_DB_REPLY)
         {
+            if(llSubStringIndex(message, "SONG_COUNT|") == 0)
+            {
+                gSongCount =
+                    (integer)llGetSubString(
+                        message,
+                        11,
+                        -1);
+
+                return;
+            }
+
             LoadSongPacket(message);
             return;
         }
@@ -569,6 +719,30 @@ default
         if(num == API_ENGINE_PLAY)
         {
             StartSong();
+            return;
+        }
+
+        if(num == API_ENGINE_PLAY_SONG)
+        {
+            PlaySpecificSong((integer)message);
+            return;
+        }
+
+        if(num == API_ENGINE_VOLUME)
+        {
+            SetUserVolume((float)message);
+            return;
+        }
+
+        if(num == API_ENGINE_NEXT)
+        {
+            PlayNextSong();
+            return;
+        }
+
+        if(num == API_ENGINE_PREV)
+        {
+            PlayPreviousSong();
             return;
         }
 
@@ -596,3 +770,4 @@ default
         llResetScript();
     }
 }
+
